@@ -29,13 +29,17 @@ type Container struct {
 	cfg                    config.Config
 	chatSessionManager     *state.InMemoryChatSessionManager
 	hmacCookieBaker        state.HMACCookieBaker
-	icbmSvc                *foodgroup.ICBMService
 	inMemorySessionManager *state.InMemorySessionManager
 	logger                 *slog.Logger
 	rateLimitClasses       wire.RateLimitClasses
 	snacRateLimits         wire.SNACRateLimits
 	sqLiteUserStore        *state.SQLiteUserStore
+	webAPISessionManager   *state.WebAPISessionManager
 	Listeners              []config.Listener
+	// WebAPI bridges shared between OSCAR and WebAPI services
+	webAPIBuddyListManager *state.WebAPIBuddyListManager
+	webAPIPresenceBridge   *state.WebAPIPresenceBridge
+	webAPIMessageBridge    *state.WebAPIMessageBridge
 }
 
 // MakeCommonDeps creates common dependencies used by the food group services.
@@ -73,20 +77,15 @@ func MakeCommonDeps() (Container, error) {
 	c.logger = middleware.NewLogger(c.cfg)
 	c.inMemorySessionManager = state.NewInMemorySessionManager(c.logger)
 	c.chatSessionManager = state.NewInMemoryChatSessionManager(c.logger)
+	c.webAPISessionManager = state.NewWebAPISessionManager()
 	c.rateLimitClasses = wire.DefaultRateLimitClasses()
 	c.snacRateLimits = wire.DefaultSNACRateLimits()
 
-	// ICBM svc is a common dep because OSCAR and TOC need to share convo
-	// history state.
-	c.icbmSvc = foodgroup.NewICBMService(
-		c.sqLiteUserStore,
-		c.inMemorySessionManager,
-		c.sqLiteUserStore,
-		c.sqLiteUserStore,
-		c.inMemorySessionManager,
-		c.snacRateLimits,
-		c.logger,
-	)
+	// Initialize WebAPI bridges (they will be fully configured later)
+	// These are created here so they can be shared between OSCAR and WebAPI services
+	c.webAPIBuddyListManager = nil // Will be set in WebAPI factory
+	c.webAPIPresenceBridge = nil   // Will be set in WebAPI factory
+	c.webAPIMessageBridge = nil    // Will be set in WebAPI factory
 
 	return c, nil
 }
@@ -210,7 +209,7 @@ func getEnvOrDefault(key, defaultValue string) string {
 }
 
 // OSCAR creates an OSCAR server for the OSCAR food group.
-func OSCAR(deps Container) *oscar.Server {
+func OSCAR(deps *Container) *oscar.Server {
 	logger := deps.logger.With("svc", "OSCAR")
 
 	adminService := foodgroup.NewAdminService(
@@ -263,6 +262,14 @@ func OSCAR(deps Container) *oscar.Server {
 		deps.inMemorySessionManager,
 		deps.inMemorySessionManager,
 	)
+	icbmService := foodgroup.NewICBMService(
+		deps.sqLiteUserStore,
+		deps.inMemorySessionManager,
+		deps.sqLiteUserStore,
+		deps.sqLiteUserStore,
+		deps.inMemorySessionManager,
+		deps.snacRateLimits,
+	)
 	icqService := foodgroup.NewICQService(deps.inMemorySessionManager, deps.sqLiteUserStore, deps.sqLiteUserStore,
 		logger, deps.inMemorySessionManager, deps.sqLiteUserStore)
 	locateService := foodgroup.NewLocateService(
@@ -307,7 +314,7 @@ func OSCAR(deps Container) *oscar.Server {
 			ChatNavService:    chatNavService,
 			ChatService:       chatService,
 			FeedbagService:    feedbagService,
-			ICBMService:       deps.icbmSvc,
+			ICBMService:       icbmService,
 			ICQService:        icqService,
 			LocateService:     locateService,
 			ODirService:       oDirService,
@@ -323,19 +330,18 @@ func OSCAR(deps Container) *oscar.Server {
 		deps.snacRateLimits,
 		oscar.NewIPRateLimiter(rate.Every(1*time.Minute), 10, 1*time.Minute),
 		deps.Listeners,
-		deps.icbmSvc.DecayWarnLevel,
 	)
 }
 
 // KerberosAPI creates an HTTP server for the Kerberos server.
-func KerberosAPI(deps Container) *kerberos.Server {
+func KerberosAPI(deps *Container) *kerberos.Server {
 	logger := deps.logger.With("svc", "Kerberos")
 	authService := foodgroup.NewAuthService(deps.cfg, deps.inMemorySessionManager, deps.inMemorySessionManager, deps.chatSessionManager, deps.sqLiteUserStore, deps.hmacCookieBaker, deps.chatSessionManager, deps.sqLiteUserStore, deps.rateLimitClasses)
 	return kerberos.NewKerberosServer(deps.Listeners, logger, authService)
 }
 
 // MgmtAPI creates an HTTP server for the management API.
-func MgmtAPI(deps Container) *http.Server {
+func MgmtAPI(deps *Container) *http.Server {
 	bld := config.Build{
 		Version: version,
 		Commit:  commit,
@@ -343,14 +349,13 @@ func MgmtAPI(deps Container) *http.Server {
 	}
 	logger := deps.logger.With("svc", "API")
 	return http.NewManagementAPI(bld, deps.cfg.APIListener, deps.sqLiteUserStore, deps.inMemorySessionManager, deps.sqLiteUserStore,
-		deps.sqLiteUserStore, deps.sqLiteUserStore, deps.chatSessionManager, deps.sqLiteUserStore, deps.inMemorySessionManager,
-		deps.sqLiteUserStore, deps.sqLiteUserStore, deps.sqLiteUserStore, deps.sqLiteUserStore, logger)
+		deps.sqLiteUserStore, deps.chatSessionManager, deps.sqLiteUserStore, deps.inMemorySessionManager,
+		deps.sqLiteUserStore, deps.sqLiteUserStore, deps.sqLiteUserStore, deps.sqLiteUserStore, deps.sqLiteUserStore, logger)
 }
 
 // TOC creates a TOC server.
-func TOC(deps Container) *toc.Server {
+func TOC(deps *Container) *toc.Server {
 	logger := deps.logger.With("svc", "TOC")
-
 	return toc.NewServer(
 		deps.cfg.TOCListeners,
 		logger,
@@ -384,7 +389,14 @@ func TOC(deps Container) *toc.Server {
 			),
 			CookieBaker:      deps.hmacCookieBaker,
 			DirSearchService: foodgroup.NewODirService(logger, deps.sqLiteUserStore),
-			ICBMService:      deps.icbmSvc,
+			ICBMService: foodgroup.NewICBMService(
+				deps.sqLiteUserStore,
+				deps.inMemorySessionManager,
+				deps.sqLiteUserStore,
+				deps.sqLiteUserStore,
+				deps.inMemorySessionManager,
+				deps.snacRateLimits,
+			),
 			LocateService: foodgroup.NewLocateService(
 				deps.sqLiteUserStore,
 				deps.inMemorySessionManager,
@@ -420,13 +432,61 @@ func TOC(deps Container) *toc.Server {
 			HTTPIPRateLimiter: toc.NewIPRateLimiter(rate.Every(1*time.Minute), 10, 1*time.Minute),
 		},
 		toc.NewIPRateLimiter(rate.Every(1*time.Minute), 10, 1*time.Minute),
-		deps.icbmSvc.DecayWarnLevel,
 	)
 }
 
 // WebAPI creates an HTTP server for the webapi protocol.
-func WebAPI(deps Container) *webapi.Server {
+func WebAPI(deps *Container) *webapi.Server {
 	logger := deps.logger.With("svc", "webapi")
+
+	// Create feedbag adapter for WebAPI
+	feedbagAdapter := &webapi.FeedbagAdapter{
+		Store: deps.sqLiteUserStore,
+	}
+
+	// Create WebAPI buddy list manager
+	buddyListManager := state.NewWebAPIBuddyListManager(
+		deps.sqLiteUserStore.DB(),
+		feedbagAdapter,
+		deps.inMemorySessionManager,
+		logger,
+	)
+
+	// Create WebAPI presence bridge
+	presenceBridge := state.NewWebAPIPresenceBridge(
+		deps.webAPISessionManager,
+		buddyListManager,
+		feedbagAdapter,
+		deps.sqLiteUserStore,
+		logger,
+	)
+
+	// Create WebAPI message bridge
+	messageBridge := state.NewWebAPIMessageBridge(
+		deps.webAPISessionManager,
+		deps.inMemorySessionManager,
+		feedbagAdapter,
+		deps.sqLiteUserStore,
+		logger,
+	)
+
+	// Store bridges in container for OSCAR services to use
+	deps.webAPIBuddyListManager = buddyListManager
+	deps.webAPIPresenceBridge = presenceBridge
+	deps.webAPIMessageBridge = messageBridge
+
+	// Set global bridges so OSCAR services can access them
+	state.SetGlobalWebAPIBridges(messageBridge, presenceBridge)
+
+	// Create the OSCAR buddy broadcaster for WebAPI to use
+	oscarBuddyBroadcaster := foodgroup.NewBuddyService(
+		deps.inMemorySessionManager,
+		deps.sqLiteUserStore,
+		deps.sqLiteUserStore,
+		deps.inMemorySessionManager,
+		deps.sqLiteUserStore,
+	)
+
 	handler := webapi.Handler{
 		AdminService: foodgroup.NewAdminService(
 			deps.sqLiteUserStore,
@@ -457,7 +517,14 @@ func WebAPI(deps Container) *webapi.Server {
 		),
 		CookieBaker:      deps.hmacCookieBaker,
 		DirSearchService: foodgroup.NewODirService(logger, deps.sqLiteUserStore),
-		ICBMService:      deps.icbmSvc,
+		ICBMService: foodgroup.NewICBMService(
+			deps.sqLiteUserStore,
+			deps.inMemorySessionManager,
+			deps.sqLiteUserStore,
+			deps.sqLiteUserStore,
+			deps.inMemorySessionManager,
+			deps.snacRateLimits,
+		),
 		LocateService: foodgroup.NewLocateService(
 			deps.sqLiteUserStore,
 			deps.inMemorySessionManager,
@@ -490,6 +557,31 @@ func WebAPI(deps Container) *webapi.Server {
 		ChatService:    foodgroup.NewChatService(deps.chatSessionManager),
 		ChatNavService: foodgroup.NewChatNavService(logger, deps.sqLiteUserStore),
 		SNACRateLimits: deps.snacRateLimits,
+		// New fields for WebAPI handlers
+		SessionRetriever: deps.inMemorySessionManager,
+		FeedbagRetriever: feedbagAdapter,
+		FeedbagManager:   feedbagAdapter,
+		// Phase 2 additions
+		MessageRelayer:        deps.inMemorySessionManager,
+		OfflineMessageManager: deps.sqLiteUserStore,
+		BuddyBroadcaster:      oscarBuddyBroadcaster,
+		ProfileManager:        deps.sqLiteUserStore,
+		RelationshipFetcher:   deps.sqLiteUserStore,
+		// Authentication support
+		UserManager: deps.sqLiteUserStore,
+		TokenStore:  state.NewWebAPITokenStore(deps.sqLiteUserStore.DB()),
+		// Phase 3 additions
+		PreferenceManager: state.NewWebPreferenceManager(deps.sqLiteUserStore.DB()),
+		PermitDenyManager: state.NewWebPermitDenyManager(deps.sqLiteUserStore.DB()),
+		// Phase 4 additions for OSCAR Bridge
+		OSCARBridgeStore: state.NewOSCARBridgeStore(deps.sqLiteUserStore.DB()),
+		OSCARConfig:      webapi.NewOSCARConfigAdapter(deps.cfg),
+		// Phase 5 additions for buddy list and messaging
+		BuddyListManager: buddyListManager,
+		PresenceBridge:   presenceBridge,
+		MessageBridge:    messageBridge,
+		// Phase 5 additions for chat rooms
+		ChatManager: state.NewWebAPIChatManager(deps.sqLiteUserStore.DB(), logger, deps.webAPISessionManager),
 	}
-	return webapi.NewServer([]string{"0.0.0.0:8081"}, logger, handler)
+	return webapi.NewServer([]string{"0.0.0.0:9000"}, logger, handler, deps.sqLiteUserStore, deps.webAPISessionManager)
 }
