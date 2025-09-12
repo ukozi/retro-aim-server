@@ -3,12 +3,14 @@ module github.com/mk6i/retro-aim-server
 go 1.24.2
 
 require (
+	github.com/breign/goAMF3 v0.0.0-00010101000000-000000000000
 	github.com/golang-migrate/migrate/v4 v4.18.3
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/mitchellh/go-wordwrap v1.0.1
 	github.com/patrickmn/go-cache v2.1.0+incompatible
+	github.com/speps/go-amf v0.0.0-20170202210820-61e26a409388
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/net v0.39.0
 	golang.org/x/sync v0.13.0
@@ -34,3 +36,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.10.0 // indirect
 )
+
+replace github.com/breign/goAMF3 => ./internal/goAMF3
